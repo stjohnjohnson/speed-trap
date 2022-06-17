@@ -8,14 +8,14 @@
  The new LIDAR-Lite from PulsedLight is pretty nice. It outputs readings very quickly. From multiple distance
  readings we can calculate speed (velocity is the derivative of position).
 
- Here's how to hook up the Arduino pins to the Large Digit Driver backpack: 
+ Here's how to hook up the Arduino pins to the Large Digit Driver backpack:
  Arduino pin 5 -> LAT
  6 -> CLK
  7 -> SER
  GND -> GND
  5V -> 5V
  VIN/Barrel Jack -> External 12V supply (this should power the LDD as well)
- 
+
  You'll also need to connect the LIDAR to the Arduino:
  Arduino 5V -> LIDAR 5V
  GND -> GND
@@ -75,7 +75,7 @@ void setup()
   Wire.begin();
 
   pinMode(en_LIDAR, OUTPUT);
-  
+
   pinMode(segmentClock, OUTPUT);
   pinMode(segmentLatch, OUTPUT);
   pinMode(segmentSerial, OUTPUT);
@@ -131,10 +131,10 @@ void loop()
 
     //Every loop let's get a reading
     newDistance = readLIDAR(); //Go get distance in cm
-    
+
     //Error checking
     if(newDistance > 1200) newDistance = 0;
-    
+
     int deltaDistance = lastDistance - newDistance;
     lastDistance = newDistance;
 
@@ -145,9 +145,9 @@ void loop()
       //We don't want to register jumps greater than 30cm in 50ms
       //But if we're less than 1000cm then maybe
       //30 works well
-      if( abs(deltaDistance - deltas[x]) > 40) safeDelta = false; 
-    }  
-    
+      if( abs(deltaDistance - deltas[x]) > 40) safeDelta = false;
+    }
+
     //Insert this new delta into the array
     if(safeDelta)
     {
@@ -163,7 +163,7 @@ void loop()
 
     //22.36936 comes from a big coversion from cm per 50ms to mile per hour
     float instantMPH = 22.36936 * (float)avgDeltas / (float)LOOPTIME;
-    
+
     instantMPH = abs(instantMPH); //We want to measure as you walk away
 
     ceil(instantMPH); //Round up to the next number. This is helpful if we're not displaying decimals.
@@ -179,7 +179,7 @@ void loop()
     {
       showSpeed(maxMPH);
     }
-    
+
     if(millis() - maxMPH_timeout > maxMPH_remember)
     {
       maxMPH = 0;
@@ -206,7 +206,7 @@ void loop()
 void petFriendlyDelay(int timeMS)
 {
   long current = millis();
-  
+
   while(millis() - current < timeMS)
   {
     delay(1);
@@ -347,7 +347,7 @@ void disableLIDAR()
 
 void enableLIDAR()
 {
-  digitalWrite(en_LIDAR, HIGH);  
+  digitalWrite(en_LIDAR, HIGH);
 }
 
 //Takes an average of readings on a given pin
