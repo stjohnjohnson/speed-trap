@@ -4,27 +4,10 @@
  SparkFun Electronics
  Date: January 5th, 2015
  License: This code is public domain but you buy me a beer if you use this and
-          we meet someday (Beerware license).
+ we meet someday (Beerware license).
 
- The new LIDAR-Lite from PulsedLight is pretty nice. It outputs readings very
- quickly. From multiple distance readings we can calculate speed (velocity is the
- derivative of position).
-
- Here's how to hook up the Arduino pins to the Large Digit Driver backpack:
- Arduino pin 5 -> LAT
- 6 -> CLK
- 7 -> SER
- GND -> GND
- 5V -> 5V
- VIN/Barrel Jack -> External 12V supply (this should power the LDD as well)
-
- You'll also need to connect the LIDAR to the Arduino:
- Arduino 5V -> LIDAR 5V
- GND -> GND
- A5 -> SCL
- A4 -> SDA
-A0 -> Enable
-
+ Revisions:
+ - St. John Johnson <st.john.johnson@gmail.com>
 */
 
 #include <Wire.h>     //Used for I2C
@@ -33,8 +16,7 @@ A0 -> Enable
 #define LIDARLite_ADDRESS 0x62  // Default I2C Address of LIDAR-Lite.
 #define RegisterMeasure 0x00    // Register to write to initiate ranging.
 #define MeasureValue 0x04       // Value to initiate ranging.
-#define RegisterHighLowB \
-  0x8F  // Register to get both High and Low bytes in 1 call.
+#define RegisterHighLowB 0x8F   // Register to get High and Low bytes in 1 call.
 
 // GPIO declarations
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -48,25 +30,34 @@ byte segmentSerial = 7;  // Serial data in
 
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-long lastTime = 0;
-long lastReading = 0;
-int lastDistance = 265;
-float newDistance;
+// Background Noise
+int backgroundDistance = 0;
 
-const byte numberOfDeltas = 8;
-float deltas[numberOfDeltas];
-byte deltaSpot = 0;  // Keeps track of where we are within the deltas array
+// Number of times we've zeroed out
+int zeroedCount = 3;
 
-// This controls how quickly the display updates
-// Too quickly and it gets twitchy. Too slow and it doesn't seem like it's
-// responding.
-#define LOOPTIME 50
+// Keep track of N number of time/distance
+const byte stackSize = 5;
+int stackDistance[stackSize];
+unsigned long stackTime[stackSize];
+int stackIndex = 0;
 
-int maxMPH = 0;           // Keeps track of what the latest fastest speed is
-long maxMPH_timeout = 0;  // Forget the max speed after some length of time
+// Current Speed
+int currentSpeed = 0;
 
-#define maxMPH_remember \
-  3000  // After this number of ms the system will forget the max speed
+// Refresh trackers
+unsigned long lastBlink = 0;
+unsigned long lastSample = 0;
+unsigned long lastDisplay = 0;
+
+// Number of milliseconds between screen updates
+#define REFRESHRATE 250
+
+// Number of milliseconds between speed measurements
+#define SAMPLERATE 50
+
+// This is the min speed before displaying
+#define MINDISPLAYSPEED 10
 
 void setup() {
   wdt_reset();    // Pet the dog
@@ -91,21 +82,28 @@ void setup() {
 
   Serial.println("Coming online");
 
+  showSpeed(42);  // Test pattern
+
   enableLIDAR();
   while (readLIDAR() == 0) {
     Serial.println("Failed LIDAR read");
     delay(100);
   }
 
-  showSpeed(42);  // Test pattern
+  // Generate test pattern and identify background distance
+  for (int i = 99; i >= 0; i -= 11) {
+    backgroundDistance += readLIDAR();
+    showSpeed(i);
+    delay(100);
+  }
 
-  delay(500);
-
-  /*postNumber('c', false);
-  postNumber(' ', false);
-  digitalWrite(segmentLatch, LOW);
-  digitalWrite(segmentLatch, HIGH); //Register moves storage register on the
-  rising edge of RCK delay(2000);*/
+  // Add some fuzzyness to the background
+  backgroundDistance = abs(ceil(((float)backgroundDistance / 10.0) * 0.9));
+  Serial.print("Background Distance: ");
+  Serial.print(backgroundDistance);
+  Serial.print("cm (");
+  Serial.print(cmToFt(backgroundDistance), 2);
+  Serial.print("ft)");
 
   wdt_reset();             // Pet the dog
   wdt_enable(WDTO_250MS);  // Unleash the beast
@@ -114,9 +112,11 @@ void setup() {
 void loop() {
   wdt_reset();  // Pet the dog
 
+  unsigned long now = millis();
+
   // Each second blink the status LED
-  if (millis() - lastTime > 1000) {
-    lastTime = millis();
+  if (now - lastBlink >= 1000) {
+    lastBlink = now;
 
     if (digitalRead(statLED) == LOW)
       digitalWrite(statLED, HIGH);
@@ -124,76 +124,163 @@ void loop() {
       digitalWrite(statLED, LOW);
   }
 
-  // Take a reading every 50ms
-  if (millis() - lastReading > (LOOPTIME - 1))  // 49)
-  {
-    lastReading = millis();
+  // Take a reading every SAMPLERATE ms
+  if (now - lastSample >= SAMPLERATE) {
+    lastSample = now;
 
     // Every loop let's get a reading
-    newDistance = readLIDAR();  // Go get distance in cm
+    int distance = readLIDAR();  // Go get distance in cm
 
-    // Error checking
-    if (newDistance > 1200) newDistance = 0;
+    // During a normal run
+    // 1. If we are zeroed out (min/max) for >150ms, reset the stack (record
+    // car complete)
+    // 2. If we are zeroed out (min/max), do not add to the stack
+    // 3. Add the distance + time to the stack (increment index)
+    // 4. Find the min/max of distance and time to identify speed.
+    // 5. Record car.
+    if (isZeroedOut(distance)) {
+      zeroedCount++;
+      if (zeroedCount == 3) {
+        Serial.print("\nCar Recorded at ");
+        Serial.print(currentSpeed);
+        Serial.println("mph");
 
-    int deltaDistance = lastDistance - newDistance;
-    lastDistance = newDistance;
+        // Clear stack
+        memset(stackDistance, 0, stackSize);
+        memset(stackTime, 0UL, stackSize);
 
-    // Scan delta array to see if this new delta is sane or not
-    boolean safeDelta = true;
-    for (int x = 0; x < numberOfDeltas; x++) {
-      // We don't want to register jumps greater than 30cm in 50ms
-      // But if we're less than 1000cm then maybe
-      // 30 works well
-      if (abs(deltaDistance - deltas[x]) > 40) safeDelta = false;
+        // Zero speed
+        currentSpeed = 0;
+      }
+      return;
+    } else {
+      zeroedCount = 0;
     }
 
-    // Insert this new delta into the array
-    if (safeDelta) {
-      deltas[deltaSpot++] = deltaDistance;
-      if (deltaSpot > numberOfDeltas) deltaSpot = 0;  // Wrap this variable
-    }
+    // Add distance + time to stack
+    stackDistance[stackIndex] = distance;
+    stackTime[stackIndex] = millis();
+    stackIndex++;
+    if (stackIndex > stackSize) stackIndex = 0;  // Wrap this variable
 
-    // Get average of the current deltas array
-    float avgDeltas = 0.0;
-    for (byte x = 0; x < numberOfDeltas; x++) avgDeltas += (float)deltas[x];
-    avgDeltas /= numberOfDeltas;
+    // Identify min/max
+    int mph = getMPH();
 
-    // 22.36936 comes from a big coversion from cm per 50ms to mile per hour
-    float instantMPH = 22.36936 * (float)avgDeltas / (float)LOOPTIME;
+    // Display speed
+    // TODO remove max() when we figure out why it's fluctuating
+    currentSpeed = max(mph, currentSpeed);
 
-    instantMPH = abs(instantMPH);  // We want to measure as you walk away
+    Serial.print("\ndistance: ");
+    Serial.print(distance);
+    Serial.print("cm (");
+    Serial.print(cmToFt(distance), 2);
+    Serial.print("ft)");
 
-    ceil(instantMPH);  // Round up to the next number. This is helpful if we're
-                       // not displaying decimals.
-
-    if (instantMPH > maxMPH) {
-      showSpeed(instantMPH);
-
-      maxMPH = instantMPH;
-      maxMPH_timeout = millis();
-    } else  // maxMPH is king
-    {
-      showSpeed(maxMPH);
-    }
-
-    if (millis() - maxMPH_timeout > maxMPH_remember) {
-      maxMPH = 0;
-      showSpeed(0);
-    }
-
-    Serial.print("raw: ");
-    Serial.print(newDistance);
-    Serial.print(" delta: ");
-    Serial.print(deltaDistance);
-    Serial.print(" cm distance: ");
-    Serial.print(newDistance * 0.0328084, 2);  // Convert to ft
-    Serial.print(" ft delta:");
-    Serial.print(abs(avgDeltas));
-    Serial.print(" speed:");
-    Serial.print(abs(instantMPH), 2);
+    Serial.print("\t| speed: ");
+    Serial.print(mph);
     Serial.print(" mph");
-    Serial.println();
   }
+
+  // Update display every REFRESHRATE ms
+  if (now - lastDisplay >= REFRESHRATE) {
+    lastDisplay = now;
+    if (currentSpeed > MINDISPLAYSPEED) {
+      Serial.print("\n*");
+      Serial.println(currentSpeed);
+    }
+
+    showSpeed(currentSpeed);
+  }
+}
+
+// Return the earliest recorded time
+unsigned long getEarliestTime() {
+  // Iterate through the stack going forward from index
+  for (byte x = stackIndex; x < stackSize + stackIndex; x++) {
+    byte y = x % stackSize;
+    if (stackTime[y] > 0UL) {
+      return stackTime[y];
+    }
+  }
+  return millis();
+}
+
+// Return the latest recorded time
+unsigned long getLatestTime() {
+  if (stackIndex == 0) {
+    return stackTime[stackSize - 1];
+  } else {
+    return stackTime[stackIndex - 1];
+  }
+}
+
+// Return the current Miles Per Hour
+int getMPH() {
+  int minDistance = backgroundDistance, maxDistance = 0;
+  int distance;
+  unsigned long elapsedTime = getLatestTime() - getEarliestTime();
+
+  for (byte x = 0; x < stackSize; x++) {
+    distance = stackDistance[x];
+    // Only read valid values
+    if (distance > 1 && distance < backgroundDistance) {
+      // Check distance
+      minDistance = min(distance, minDistance);
+      maxDistance = max(distance, maxDistance);
+    }
+  }
+
+  // 22.3694 is conversion of cm per millisecond to miles per hour
+  float deltaDistance = (float)(maxDistance - minDistance),
+        loopTime = (float)elapsedTime, mph = deltaDistance / loopTime * 22.3694;
+
+  // We shouldn't get here!!  Data dump for help.
+  if (mph > 50) {
+    Serial.println("\nDebug Data Dump");
+    Serial.print("min/");
+    Serial.print(minDistance);
+    Serial.print(" max/");
+    Serial.print(maxDistance);
+    Serial.print(" delta/");
+    Serial.print(deltaDistance, 2);
+    Serial.print(" loopTime/");
+    Serial.print(loopTime, 2);
+    Serial.print(" mph/");
+    Serial.print(mph, 2);
+    Serial.println();
+    Serial.print("previousTime/");
+    Serial.print(stackTime[previousIndex()]);
+    Serial.print(" oldestTime/");
+    Serial.println(getEarliestTime());
+
+    for (byte x = 0; x < stackSize; x++) {
+      Serial.print("d[");
+      Serial.print((int)x);
+      Serial.print("] == ");
+      Serial.println(stackDistance[x]);
+    }
+    for (byte x = 0; x < stackSize; x++) {
+      Serial.print("t[");
+      Serial.print((int)x);
+      Serial.print("] == ");
+      Serial.println(stackTime[x]);
+    }
+    Serial.println("End Debug Data Dump");
+  }
+
+  // Calculate speed by determining cm per millisecond and converting to miles
+  // per hour
+  return ceil(mph);
+}
+
+float cmToFt(int cm) { return (float)cm * 0.0328084; }
+
+// Are we reading the edge of infinity?
+bool isZeroedOut(int distance) {
+  if (distance == 1 || distance > backgroundDistance) {
+    return true;
+  }
+  return false;
 }
 
 // A watch dog friendly delay
@@ -244,18 +331,26 @@ int readLIDAR(void) {
   }
 }
 
-// Takes a speed and displays 2 numbers. Displays absolute value (no negatives)
+// Takes a speed and displays 2 numbers. Displays absolute value (no
+// negatives)
 void showSpeed(float speed) {
-  int number = abs(speed);  // Remove negative signs and any decimals
-
-  // Serial.print("number: ");
-  // Serial.println(number);
+  int absSpeed = abs(speed);
+  int number = absSpeed;  // Remove negative signs and any decimals
 
   for (byte x = 0; x < 2; x++) {
+    byte output;
     int remainder = number % 10;
 
-    postNumber(remainder, false);
+    // todo Skip leading 0s?
+    // todo Blink above a certain speed
+    // Skip if the speed is too low
+    if (absSpeed < MINDISPLAYSPEED) {
+      output = ' ';
+    } else {
+      output = remainder;
+    }
 
+    postNumber(output, false);
     number /= 10;
   }
 
@@ -328,21 +423,6 @@ void postNumber(byte number, boolean decimal) {
       break;
   }
 
-  // The method uses 7954 bytes
-  /*if(number == 1) segments = b|c;
-  if(number == 2) segments = a|b|d|e|g;
-  if(number == 3) segments = a|b|c|d|g;
-  if(number == 4) segments = f|g|b|c;
-  if(number == 5) segments = a|f|g|c|d;
-  if(number == 6) segments = a|f|g|e|c|d;
-  if(number == 7) segments = a|b|c;
-  if(number == 8) segments = a|b|c|d|e|f|g;
-  if(number == 9) segments = a|b|c|d|f|g;
-  if(number == 0) segments = a|b|c|d|e|f;
-  if(number == ' ') segments = 0;
-  if(number == 'c') segments = g | e | d;
-  if(number == '-') segments = g;*/
-
   if (decimal) segments |= dp;
 
   for (byte x = 0; x < 8; x++) {
@@ -358,16 +438,3 @@ void postNumber(byte number, boolean decimal) {
 void disableLIDAR() { digitalWrite(en_LIDAR, LOW); }
 
 void enableLIDAR() { digitalWrite(en_LIDAR, HIGH); }
-
-// Takes an average of readings on a given pin
-// Returns the average
-int averageAnalogRead(byte pinToRead) {
-  byte numberOfReadings = 8;
-  unsigned int runningValue = 0;
-
-  for (int x = 0; x < numberOfReadings; x++)
-    runningValue += analogRead(pinToRead);
-  runningValue /= numberOfReadings;
-
-  return (runningValue);
-}
