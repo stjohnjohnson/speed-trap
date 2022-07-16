@@ -10,8 +10,8 @@
  - St. John Johnson <st.john.johnson@gmail.com>
 */
 
-#include <Wire.h>     //Used for I2C
-#include <avr/wdt.h>  //We need watch dog for this program
+#include <Wire.h>     // Used for I2C
+#include <avr/wdt.h>  // We need watch dog for this program
 
 #define LIDARLite_ADDRESS 0x62  // Default I2C Address of LIDAR-Lite.
 #define RegisterMeasure 0x00    // Register to write to initiate ranging.
@@ -21,8 +21,8 @@
 // GPIO declarations
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-byte statLED = 13;   // On board status LED
-byte en_LIDAR = A0;  // Low makes LIDAR go to sleep, high is normal operation
+byte statLED = 13;    // On board status LED
+byte en_LIDAR = A0;   // Low makes LIDAR go to sleep, high is normal operation
 
 byte segmentLatch = 5;   // Display data when this pin goes high
 byte segmentClock = 6;   // Clock one bit on each rising/falling edge
@@ -44,20 +44,31 @@ int stackIndex = 0;
 
 // Current Speed
 int currentSpeed = 0;
+int minSpeed = 999;
+int maxSpeed = 0;
+int totalSpeed = 0;
+int totalReadings = 0;
 
 // Refresh trackers
 unsigned long lastBlink = 0;
 unsigned long lastSample = 0;
 unsigned long lastDisplay = 0;
+unsigned long lastClear = 0;
+
+// Number of milliseconds between going back to 0
+#define HOLDTIME 2000
 
 // Number of milliseconds between screen updates
-#define REFRESHRATE 250
+#define REFRESHRATE 200
 
 // Number of milliseconds between speed measurements
 #define SAMPLERATE 50
 
 // This is the min speed before displaying
-#define MINDISPLAYSPEED 10
+#define MINDISPLAYSPEED 1
+
+// Verbosity with logs
+#define VERBOSE false
 
 void setup() {
   wdt_reset();    // Pet the dog
@@ -103,7 +114,7 @@ void setup() {
   Serial.print(backgroundDistance);
   Serial.print("cm (");
   Serial.print(cmToFt(backgroundDistance), 2);
-  Serial.print("ft)");
+  Serial.println("ft)");
 
   wdt_reset();             // Pet the dog
   wdt_enable(WDTO_250MS);  // Unleash the beast
@@ -141,9 +152,18 @@ void loop() {
     if (isZeroedOut(distance)) {
       zeroedCount++;
       if (zeroedCount == 3) {
-        Serial.print("\nCar Recorded at ");
+        Serial.print("Car Recorded:");
+        Serial.print(" min/");
+        Serial.print(minSpeed);
+        Serial.print(" max/");
+        Serial.print(maxSpeed);
+        Serial.print(" avg/");
+        Serial.print(ceil(totalSpeed / totalReadings));
+        Serial.print(" last/");
         Serial.print(currentSpeed);
-        Serial.println("mph");
+        Serial.print(" time/");
+        Serial.print(totalReadings * SAMPLERATE);
+        Serial.println();
 
         // Clear stack
         memset(stackDistance, 0, stackSize);
@@ -151,6 +171,11 @@ void loop() {
 
         // Zero speed
         currentSpeed = 0;
+        minSpeed = 999;
+        maxSpeed = 0;
+        totalSpeed = 0;
+        totalReadings = 0;
+        lastClear = now;
       }
       return;
     } else {
@@ -161,35 +186,42 @@ void loop() {
     stackDistance[stackIndex] = distance;
     stackTime[stackIndex] = millis();
     stackIndex++;
-    if (stackIndex > stackSize) stackIndex = 0;  // Wrap this variable
+    if (stackIndex >= stackSize) stackIndex = 0;  // Wrap this variable
 
     // Identify min/max
     int mph = getMPH();
 
     // Display speed
-    // TODO remove max() when we figure out why it's fluctuating
-    currentSpeed = max(mph, currentSpeed);
+    currentSpeed = mph;
+    minSpeed = min(mph, minSpeed);
+    maxSpeed = max(mph, maxSpeed);
+    totalSpeed += mph;
+    totalReadings++;
 
-    Serial.print("\ndistance: ");
-    Serial.print(distance);
-    Serial.print("cm (");
-    Serial.print(cmToFt(distance), 2);
-    Serial.print("ft)");
+    if (VERBOSE) {
+      Serial.print("distance: ");
+      Serial.print(distance);
+      Serial.print("cm (");
+      Serial.print(cmToFt(distance), 2);
+      Serial.print("ft)");
 
-    Serial.print("\t| speed: ");
-    Serial.print(mph);
-    Serial.print(" mph");
+      Serial.print("\t| speed: ");
+      Serial.print(mph);
+      Serial.println(" mph");
+    }
   }
 
   // Update display every REFRESHRATE ms
   if (now - lastDisplay >= REFRESHRATE) {
     lastDisplay = now;
-    if (currentSpeed > MINDISPLAYSPEED) {
-      Serial.print("\n*");
-      Serial.println(currentSpeed);
+    if (currentSpeed != 0) {
+      showSpeed(currentSpeed);
+    } else {
+      if (now - lastClear >= HOLDTIME) {
+        lastClear = now;
+        showSpeed(0);
+      }
     }
-
-    showSpeed(currentSpeed);
   }
 }
 
@@ -234,8 +266,7 @@ int getMPH() {
   float deltaDistance = (float)(maxDistance - minDistance),
         loopTime = (float)elapsedTime, mph = deltaDistance / loopTime * 22.3694;
 
-  // We shouldn't get here!!  Data dump for help.
-  if (mph > 50) {
+  if (VERBOSE) {
     Serial.println("\nDebug Data Dump");
     Serial.print("min/");
     Serial.print(minDistance);
@@ -249,7 +280,7 @@ int getMPH() {
     Serial.print(mph, 2);
     Serial.println();
     Serial.print("previousTime/");
-    Serial.print(stackTime[previousIndex()]);
+    Serial.print(getLatestTime());
     Serial.print(" oldestTime/");
     Serial.println(getEarliestTime());
 
